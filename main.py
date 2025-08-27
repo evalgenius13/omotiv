@@ -2,13 +2,13 @@
 """Omotiv v1.0 - Audio Source Separation Tool (Core Features Only)"""
 
 import os
+import ssl
 import torch
 import torchaudio
-import numpy as np
-import ssl
-import warnings
 from pathlib import Path
-import tempfile
+import warnings
+import tempfile  # <-- Add this line near the top of main.py
+
 
 from PyQt6.QtCore import Qt, QTimer, QThread
 from PyQt6.QtWidgets import (
@@ -26,16 +26,54 @@ from audio.player import AudioPlayer
 from ui.level_meter import LevelMeter
 from ui.waveform_widget import AudioEditorSection
 from ui.recording_booth import RecordingBooth
+from audio.model_manager import ModelManager
+
+model_manager = ModelManager()
+processor = AudioProcessor(model_manager)
 
 ssl._create_default_https_context = ssl._create_unverified_context
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+
+from PyQt6.QtCore import QObject, pyqtSignal
+
+class AudioWorker(QObject):
+    progress_updated = pyqtSignal(int)
+    status_updated = pyqtSignal(str)
+    processing_finished = pyqtSignal(str)
+    
+    def __init__(self, processor, input_file, output_dir, instruments_to_remove):
+        super().__init__()
+        self.processor = processor
+        self.input_file = input_file
+        self.output_dir = output_dir
+        self.instruments_to_remove = instruments_to_remove
+        self._cancelled = False
+
+    def run(self):
+        try:
+            # Call the processor's run method (update this as needed for your processor API)
+            output_file = self.processor.run(
+                self.input_file,
+                self.output_dir,
+                self.instruments_to_remove,
+                progress_callback=self.progress_updated.emit,
+                status_callback=self.status_updated.emit,
+                cancelled=lambda: self._cancelled
+            )
+            self.processing_finished.emit(output_file)
+        except Exception as e:
+            self.status_updated.emit(f"Error: {str(e)}")
+            self.processing_finished.emit("")
+    
+    def cancel(self):
+        self._cancelled = True
 
 class OmotivApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.input_file = None
         self.output_dir = tempfile.gettempdir()
-        self.processing_thread = None
+        self.worker = None
         self.thread = None
         self.recording_thread = None
         self.level_monitor = None
@@ -134,7 +172,7 @@ class OmotivApp(QMainWindow):
 
         # Instrument selection
         instrument_group = QGroupBox("Mute One Instrument")
-        instrument_layout = QVBoxLayout(instrument_group)
+        instrument_layout = QHBoxLayout(instrument_group)
         self.instrument_group_buttons = QButtonGroup(self)
         self.instrument_group_buttons.setExclusive(True)
         self.instrument_radios = {}
@@ -151,6 +189,8 @@ class OmotivApp(QMainWindow):
             instrument_layout.addWidget(radio)
         self.instrument_radios["vocals"].setChecked(True)
         layout.addWidget(instrument_group)
+
+
 
         # Process button
         self.process_btn = QPushButton("Process Audio")
@@ -191,19 +231,16 @@ class OmotivApp(QMainWindow):
 
         self.file_group.setVisible(False)
 
-        self.processing_thread = AudioProcessor(self.model_manager)
+        processor = AudioProcessor(self.model_manager)
+        self.worker = AudioWorker(processor, self.input_file, self.output_dir, instruments_to_remove)
         self.thread = QThread(self)
-        self.processing_thread.moveToThread(self.thread)  # <-- CRUCIAL FIX
+        self.worker.moveToThread(self.thread)
 
-        from functools import partial
-        self.thread.started.connect(
-            partial(self.processing_thread.run,
-                    self.input_file, self.output_dir, instruments_to_remove)
-        )
-        self.processing_thread.progress_updated.connect(self.update_progress)
-        self.processing_thread.status_updated.connect(self.add_status)
-        self.processing_thread.processing_finished.connect(self.processing_finished)
-        self.processing_thread.processing_finished.connect(self.thread.quit)
+        self.thread.started.connect(self.worker.run)
+        self.worker.progress_updated.connect(self.update_progress)
+        self.worker.status_updated.connect(self.add_status)
+        self.worker.processing_finished.connect(self.processing_finished)
+        self.worker.processing_finished.connect(self.thread.quit)
         self.thread.finished.connect(self.thread.deleteLater)
 
         self.thread.start()
@@ -230,8 +267,8 @@ class OmotivApp(QMainWindow):
             print(msg)
 
     def cancel_processing(self):
-        if self.processing_thread:
-            self.processing_thread.cancel()
+        if self.worker:
+            self.worker.cancel()
             self.cancel_btn.setVisible(False)
             self.progress_bar.setVisible(False)
             self.add_status("User cancelled processing.")
@@ -266,8 +303,8 @@ class OmotivApp(QMainWindow):
     # ===== Cleanup =====
     def closeEvent(self, event):
         try:
-            if self.processing_thread:
-                self.processing_thread.cancel()
+            if self.worker:
+                self.worker.cancel()
             if self.thread:
                 try:
                     if self.thread.isRunning():
@@ -276,7 +313,7 @@ class OmotivApp(QMainWindow):
                 except RuntimeError:
                     pass
                 self.thread = None
-                self.processing_thread = None
+                self.worker = None
 
             if self.recording_thread:
                 try:
