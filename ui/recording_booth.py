@@ -1,15 +1,17 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QSlider, QLabel,
-    QComboBox, QPushButton, QFileDialog, QMessageBox, QProgressBar
+    QComboBox, QPushButton, QFileDialog, QMessageBox, QLineEdit, QApplication
 )
 from PyQt6.QtCore import Qt, QTimer
+from ui.level_meter import LevelMeter
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
 import os
 import threading
+from datetime import datetime
+import sys
 
-# ------ AudioPlayer with real volume and output metering ------
 class AudioPlayer:
     def __init__(self):
         self.stream = None
@@ -17,17 +19,24 @@ class AudioPlayer:
         self.samplerate = 44100
         self.position = 0
         self.is_playing = False
-        self.output_device = None
         self._lock = threading.Lock()
-        self._last_chunk = None  # For output level metering
-        self.volume = 1.0  # Real volume applied during playback
+        self._last_chunk = None
+        self.volume = 1.0
 
     def load(self, file_path):
-        self.data, self.samplerate = sf.read(file_path, dtype="float32")
-        if self.data.ndim == 1:
-            self.data = np.expand_dims(self.data, axis=1)
+        self.data, self.samplerate = sf.read(file_path, dtype="float32", always_2d=True)
         with self._lock:
             self.position = 0
+
+    def trim(self, start_sec=None, end_sec=None):
+        if self.data is not None:
+            sr = self.samplerate
+            total = len(self.data)
+            start_frame = int(start_sec * sr) if start_sec else 0
+            end_frame = int(end_sec * sr) if end_sec else total
+            self.data = self.data[start_frame:end_frame]
+            with self._lock:
+                self.position = 0
 
     def _callback(self, outdata, frames, time, status):
         if status:
@@ -37,11 +46,7 @@ class AudioPlayer:
             end = min(start + frames, len(self.data))
             chunk = self.data[start:end]
             self.position = end
-
-        # Apply real-time volume
         chunk = chunk * self.volume
-
-        # Store chunk for output metering
         self._last_chunk = chunk.copy() if len(chunk) > 0 else None
 
         if len(chunk) < frames:
@@ -107,68 +112,14 @@ class AudioPlayer:
         return len(self.data) / self.samplerate if self.data is not None else 0.0
 
     def get_output_level(self):
-        # RMS calculation for last chunk played
         chunk = self._last_chunk
         if chunk is None or len(chunk) == 0:
             return 0.0
         rms = np.sqrt(np.mean(chunk**2))
-        return min(rms * 5, 1.0)  # scale for meter (tweak as needed)
+        return min(rms * 5, 1.0)
 
-# ------ Colored Level Meter ------
-class ColoredLevelMeter(QProgressBar):
-    def __init__(self, label_text="Level", parent=None):
-        super().__init__(parent)
-        self.label_text = label_text
-        self.setMinimum(0)
-        self.setMaximum(100)
-        self.setValue(0)
-        self.setFormat(f"{self.label_text}: %p%")
-        self.setTextVisible(True)
-        self.setFixedHeight(22)
-        self.setStyleSheet("""
-        QProgressBar {
-            border: 1px solid #bbb;
-            border-radius: 8px;
-            background: #222;
-            text-align: center;
-        }
-        QProgressBar::chunk {
-            background-color: #44cc44;
-            border-radius: 8px;
-        }
-        """)
-
-    def update_level(self, value):
-        # value: 0.0 ... 1.0
-        percent = int(value * 100)
-        self.setValue(percent)
-        # Change color based on level
-        if percent < 60:
-            color = "#44cc44"  # green
-        elif percent < 85:
-            color = "#dddd44"  # yellow
-        else:
-            color = "#dd4444"  # red
-        self.setStyleSheet(f"""
-        QProgressBar {{
-            border: 1px solid #bbb;
-            border-radius: 8px;
-            background: #222;
-            text-align: center;
-        }}
-        QProgressBar::chunk {{
-            background-color: {color};
-            border-radius: 8px;
-        }}
-        """)
-
-# ------ Main Booth Dialog ------
 class RecordingBooth(QDialog):
-    """
-    Modal dialog for overdubbing vocals over a track.
-    Features: input selector, input+output level meters (real, colored), volume sliders, play/pause for track & vocal, export, disables as needed.
-    """
-    def __init__(self, input_file, output_dir, trim_start=None, trim_end=None, parent=None):
+    def __init__(self, input_file, output_dir, trim_start=0, trim_end=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Recording Booth")
         self.input_file = input_file
@@ -176,30 +127,48 @@ class RecordingBooth(QDialog):
         self.trim_start = trim_start
         self.trim_end = trim_end
 
-        self.audio_input_device = None
-        self.input_stream = None
+        self.audio_input_device_index = None
         self.input_level = 0.0
+        self._level_lock = threading.Lock()
+        self.input_meter_stream = None
 
         self.recorded_vocal = None
         self.is_recording = False
+        self.recording_data = []
+        self._record_lock = threading.Lock()
+        self.record_stream = None
+        self.record_timer = None
+        self.elapsed_seconds = 0
+        self.max_record_seconds = 600
+        self.max_recording_chunks = self.max_record_seconds * 44
 
         self.track_player = AudioPlayer()
         self.vocal_player = AudioPlayer()
 
+        self.track_player.load(self.input_file)
+        self.track_duration_seconds = self.track_player.get_duration()
+        
         self.init_ui()
         self.update_ui_state()
 
-        # Output level polling
         self.output_monitor_timer = QTimer()
         self.output_monitor_timer.timeout.connect(self.poll_output_level)
         self.output_monitor_timer.start(100)
 
-        # Input level polling (only started when device selected)
         self.input_monitor_timer = QTimer()
         self.input_monitor_timer.timeout.connect(self.update_input_meter)
 
+        self.elapsed_timer = QTimer()
+        self.elapsed_timer.timeout.connect(self.update_elapsed_time)
+
     def init_ui(self):
         layout = QVBoxLayout(self)
+
+        # Booth info header
+        info_label = QLabel("Recording Booth - Use main page for seeking and waveform control")
+        info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_label.setStyleSheet("color: #888; font-style: italic; padding: 10px;")
+        layout.addWidget(info_label)
 
         # Input Selector
         input_layout = QHBoxLayout()
@@ -211,16 +180,33 @@ class RecordingBooth(QDialog):
         input_layout.addWidget(self.input_selector)
         layout.addLayout(input_layout)
 
-        # Level Meters (colored and real)
-        self.level_meter = ColoredLevelMeter("Input Level")
-        layout.addWidget(self.level_meter)
-        self.output_level_meter = ColoredLevelMeter("Output Level")
-        layout.addWidget(self.output_level_meter)
+        # Level Meters
+        input_label = QLabel("INPUT")
+        input_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(input_label)
+        self.input_meter = LevelMeter(channels=1)
+        layout.addWidget(self.input_meter)
+        
+        playback_label = QLabel("PLAYBACK")
+        playback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(playback_label)
+        self.output_meter = LevelMeter(channels=1)
+        layout.addWidget(self.output_meter)
 
-        # Warning label
-        self.warning_label = QLabel("")
-        self.warning_label.setStyleSheet("color: red;")
-        layout.addWidget(self.warning_label)
+        # Track info display (read-only from main page settings)
+        track_group = QGroupBox("Recording Section (Set on Main Page)")
+        track_layout = QVBoxLayout(track_group)
+        self.track_info_label = QLabel("")
+        self.track_info_label.setStyleSheet("font-weight: bold;")
+        track_layout.addWidget(self.track_info_label)
+        
+        # Add note about changing settings
+        change_note = QLabel("To change recording section, close booth and adjust on main page")
+        change_note.setStyleSheet("color: #666; font-style: italic; font-size: 11px;")
+        track_layout.addWidget(change_note)
+        
+        self.update_track_info_label()
+        layout.addWidget(track_group)
 
         # Volume Controls
         volume_group = QGroupBox("Volume Controls")
@@ -242,41 +228,47 @@ class RecordingBooth(QDialog):
         volume_group.setLayout(volume_layout)
         layout.addWidget(volume_group)
 
-        # Control Buttons
+        # Recording timer
+        self.recording_timer_label = QLabel("")
+        self.recording_timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.recording_timer_label)
+
+        # Control Buttons - focused on recording workflow
         btn_layout = QHBoxLayout()
-        self.play_track_btn = QPushButton("Play Track")
-        self.play_track_btn.clicked.connect(self.on_play_pause_track)
-        btn_layout.addWidget(self.play_track_btn)
-        self.test_track_btn = QPushButton("Test Track")
-        self.test_track_btn.clicked.connect(self.on_test_track)
-        btn_layout.addWidget(self.test_track_btn)
+        
+        # Recording controls
         self.record_btn = QPushButton("Record Take")
         self.record_btn.clicked.connect(self.on_record)
         btn_layout.addWidget(self.record_btn)
+        
+        self.stop_btn = QPushButton("Stop Recording")
+        self.stop_btn.clicked.connect(self.on_stop_recording)
+        self.stop_btn.setVisible(False)
+        btn_layout.addWidget(self.stop_btn)
+        
+        self.cancel_btn = QPushButton("Cancel Recording")
+        self.cancel_btn.clicked.connect(self.on_cancel_recording)
+        self.cancel_btn.setVisible(False)
+        btn_layout.addWidget(self.cancel_btn)
+        
+        # Playback controls (simplified)
+        self.play_track_btn = QPushButton("Play Track Section")
+        self.play_track_btn.clicked.connect(self.on_play_pause_track)
+        btn_layout.addWidget(self.play_track_btn)
+        
         self.play_vocal_btn = QPushButton("Play Vocal")
         self.play_vocal_btn.clicked.connect(self.on_play_pause_vocal)
         btn_layout.addWidget(self.play_vocal_btn)
-        self.export_btn = QPushButton("Export")
+        
+        # Export
+        self.export_btn = QPushButton("Export Mix")
         self.export_btn.clicked.connect(self.on_export)
         btn_layout.addWidget(self.export_btn)
+        
         layout.addLayout(btn_layout)
 
-        # Export options dialog (radio buttons)
-        self.export_group = QGroupBox("Export Options")
-        self.export_radio_mix = QPushButton("Export Mix (Track + Vocal)")
-        self.export_radio_mix.setCheckable(True)
-        self.export_radio_vocal = QPushButton("Export Vocal Only")
-        self.export_radio_vocal.setCheckable(True)
-        self.export_radio_mix.setChecked(True)
-        export_radio_layout = QHBoxLayout()
-        export_radio_layout.addWidget(self.export_radio_mix)
-        export_radio_layout.addWidget(self.export_radio_vocal)
-        self.export_group.setLayout(export_radio_layout)
-        layout.addWidget(self.export_group)
-        self.export_group.setVisible(False)
-
         # Status label
-        self.status_label = QLabel("Ready")
+        self.status_label = QLabel("Ready - Select input device to begin")
         layout.addWidget(self.status_label)
 
         self.setLayout(layout)
@@ -294,80 +286,89 @@ class RecordingBooth(QDialog):
 
     def on_input_selected(self, idx):
         selected_text = self.input_selector.currentText()
-        # Stop previous input stream if any
-        self.stop_input_stream()
-        self.input_level = 0.0
-        self.level_meter.update_level(0.0)
+        with self._level_lock:
+            self.input_level = 0.0
+        self.input_meter.update_levels([0.0])
         if selected_text == "None" or "No devices" in selected_text:
-            self.audio_input_device = None
-            self.warning_label.setText("No input device selected. Recording and vocal playback disabled.")
+            self.audio_input_device_index = None
             self.input_monitor_timer.stop()
+            self.stop_input_meter_stream()
+            self.status_label.setText("No input selected - recording disabled")
         else:
-            self.audio_input_device = selected_text
-            self.warning_label.setText("")
-            self.start_input_stream(selected_text)
-            self.input_monitor_timer.start(100)
+            self.audio_input_device_index = self._find_device_index(selected_text)
+            if self.audio_input_device_index is not None:
+                self.start_input_meter_stream()
+                self.input_monitor_timer.start(50)
+                self.status_label.setText("Input ready - you can now record")
+            else:
+                self.status_label.setText("Input device not found")
         self.update_ui_state()
 
-    def start_input_stream(self, device_name):
-        # Find device index
-        device_index = None
-        devices = sd.query_devices()
-        for i, d in enumerate(devices):
-            if d.get('name') == device_name:
-                device_index = i
-                break
-        if device_index is None:
-            return
-        # Start a stream for metering
-        def callback(indata, frames, time, status):
-            if status:
-                print("Input stream status:", status)
-            # Compute RMS for input
-            rms = np.sqrt(np.mean(indata ** 2))
-            self.input_level = min(rms * 5, 1.0)  # scale for meter
-
+    def _find_device_index(self, device_name):
         try:
-            self.input_stream = sd.InputStream(
-                device=device_index,
-                channels=1,
-                samplerate=44100,
-                blocksize=1024,
-                callback=callback
-            )
-            self.input_stream.start()
+            devices = sd.query_devices()
+            for i, d in enumerate(devices):
+                if device_name in d.get('name', '') and d.get('max_input_channels', 0) > 0:
+                    return i
         except Exception as e:
-            print("Mic meter failed:", e)
-            self.input_stream = None
-
-    def stop_input_stream(self):
-        try:
-            if self.input_stream is not None:
-                self.input_stream.stop()
-                self.input_stream.close()
-                self.input_stream = None
-        except Exception:
-            self.input_stream = None
+            print(f"Error finding device index: {e}")
+        return None
 
     def update_input_meter(self):
-        self.level_meter.update_level(self.input_level)
+        with self._level_lock:
+            current_level = self.input_level
+        self.input_meter.update_levels([current_level])
+
+    def start_input_meter_stream(self):
+        if self.audio_input_device_index is None:
+            return
+        def meter_callback(indata, frames, time, status):
+            try:
+                rms = np.sqrt(np.mean(indata ** 2))
+                with self._level_lock:
+                    self.input_level = min(rms * 5, 1.0)
+            except Exception:
+                pass
+        try:
+            self.input_meter_stream = sd.InputStream(
+                device=self.audio_input_device_index,
+                channels=1,
+                samplerate=44100,
+                callback=meter_callback,
+                dtype='float32',
+                blocksize=1024
+            )
+            self.input_meter_stream.start()
+        except Exception as e:
+            print(f"Input meter stream failed: {e}")
+            self.input_meter_stream = None
+
+    def stop_input_meter_stream(self):
+        try:
+            if self.input_meter_stream is not None:
+                self.input_meter_stream.stop()
+                self.input_meter_stream.close()
+                self.input_meter_stream = None
+        except Exception:
+            self.input_meter_stream = None
 
     def poll_output_level(self):
-        # Output level from currently playing track or vocal
         level = 0.0
         if self.track_player.is_playing:
             level = self.track_player.get_output_level()
         elif self.vocal_player.is_playing:
             level = self.vocal_player.get_output_level()
-        self.output_level_meter.update_level(level)
+        self.output_meter.update_levels([level])
 
     def update_ui_state(self):
-        has_input = self.audio_input_device is not None
-        self.record_btn.setEnabled(has_input)
-        self.play_vocal_btn.setEnabled(has_input and self.recorded_vocal is not None)
-        self.export_btn.setEnabled(True)
-        self.play_track_btn.setEnabled(True)
-        self.test_track_btn.setEnabled(True)
+        has_input = self.audio_input_device_index is not None
+        self.record_btn.setEnabled(has_input and not self.is_recording)
+        self.stop_btn.setVisible(self.is_recording)
+        self.cancel_btn.setVisible(self.is_recording)
+        self.play_vocal_btn.setEnabled(has_input and self.recorded_vocal is not None and not self.is_recording)
+        self.export_btn.setEnabled(self.recorded_vocal is not None and not self.is_recording)
+        self.play_track_btn.setEnabled(not self.is_recording)
+        
         if not has_input:
             self.record_btn.setStyleSheet("color: grey;")
             self.play_vocal_btn.setStyleSheet("color: grey;")
@@ -382,82 +383,131 @@ class RecordingBooth(QDialog):
         self.vocal_player.volume = value / 100.0
 
     def on_play_pause_track(self):
-        if not self.input_file or not os.path.exists(self.input_file):
-            QMessageBox.warning(self, "No Track", "No track loaded or file missing.")
-            return
+        """Play the trimmed section of the track"""
         if self.track_player.is_playing:
             self.track_player.pause()
-            self.play_track_btn.setText("Play Track")
+            self.play_track_btn.setText("Play Track Section")
             self.status_label.setText("Track paused.")
         else:
-            if self.track_player.data is None:
-                self.track_player.load(self.input_file)
+            # Load and trim the track to the specified section
+            self.track_player.load(self.input_file)
+            self.track_player.trim(self.trim_start, self.trim_end)
             self.track_player.play()
             self.play_track_btn.setText("Pause Track")
-            self.status_label.setText("Playing track...")
-
-    def on_test_track(self):
-        # Alias for Play Track, but disables record so user can safely test their setup before recording
-        if self.track_player.is_playing:
-            self.on_play_pause_track()
-            self.test_track_btn.setText("Test Track")
-            self.status_label.setText("Track test stopped.")
-            self.record_btn.setEnabled(True)
-        else:
-            if not self.input_file or not os.path.exists(self.input_file):
-                QMessageBox.warning(self, "No Track", "No track loaded or file missing.")
-                return
-            if self.track_player.data is None:
-                self.track_player.load(self.input_file)
-            self.track_player.play()
-            self.test_track_btn.setText("Stop Test")
-            self.status_label.setText("Testing track output...")
-            self.record_btn.setEnabled(False)
+            self.status_label.setText(f"Playing track section ({self.trim_start}s to {self.trim_end if self.trim_end else 'end'}s)")
 
     def on_record(self):
-        # Stop playback before recording
-        if self.track_player.is_playing:
-            self.track_player.pause()
-            self.play_track_btn.setText("Play Track")
-            self.test_track_btn.setText("Test Track")
-            self.record_btn.setEnabled(True)
+        """Start recording with backing track"""
+        # Start backing track for timing
+        self.track_player.load(self.input_file)
+        self.track_player.trim(self.trim_start, self.trim_end)
+        self.track_player.play()
+        
+        # Stop input monitoring during recording
+        self.input_monitor_timer.stop()
+        
         self.is_recording = True
-        self.status_label.setText("Recording... (mic input required)")
-        self.record_btn.setEnabled(False)
-
-        duration = 5  # seconds (adjust as needed)
-        samplerate = 44100
-        channels = 1
-
+        self.status_label.setText("Recording... (max 10:00)")
+        self.elapsed_seconds = 0
+        self.recording_timer_label.setText("Recording: 00:00 / 10:00")
+        self.recording_data = []
+        self._record_lock = threading.Lock()
+        self.update_ui_state()
+        
         try:
-            device_index = None
-            if self.audio_input_device:
-                # Find device index from name
-                devices = sd.query_devices()
-                for i, d in enumerate(devices):
-                    if d.get('name') == self.audio_input_device:
-                        device_index = i
-                        break
-            recording = sd.rec(
-                int(duration * samplerate),
-                samplerate=samplerate,
-                channels=channels,
+            def record_callback(indata, frames, time, status):
+                try:
+                    if status:
+                        print(f"Recording status: {status}")
+                    with self._record_lock:
+                        if len(self.recording_data) < self.max_recording_chunks:
+                            self.recording_data.append(indata.copy())
+                        else:
+                            print("Warning: Recording buffer full, dropping frames")
+                except Exception as e:
+                    print(f"Recording callback error: {e}")
+                    
+            self.record_stream = sd.InputStream(
+                device=self.audio_input_device_index,
+                channels=1,
+                samplerate=44100,
+                callback=record_callback,
                 dtype='float32',
-                device=device_index,
+                blocksize=1024
             )
-            sd.wait()
-            vocal_path = os.path.join(self.output_dir, "vocal_take.wav")
-            sf.write(vocal_path, recording, samplerate)
-            self.recorded_vocal = vocal_path
-            self.status_label.setText("Recording finished.")
+            
+            self.record_stream.start()
+            self.elapsed_timer.start(1000)
+            
+            # Auto-stop timer
+            self.auto_stop_timer = QTimer()
+            self.auto_stop_timer.setSingleShot(True)
+            self.auto_stop_timer.timeout.connect(self.on_auto_stop_recording)
+            self.auto_stop_timer.start(self.max_record_seconds * 1000)
+            
         except Exception as e:
             QMessageBox.critical(self, "Recording Error", str(e))
             self.status_label.setText("Recording failed.")
-            self.recorded_vocal = None
+            self.is_recording = False
+            self.update_ui_state()
 
+    def update_elapsed_time(self):
+        self.elapsed_seconds += 1
+        mins = self.elapsed_seconds // 60
+        secs = self.elapsed_seconds % 60
+        self.recording_timer_label.setText(f"Recording: {mins:02d}:{secs:02d} / 10:00")
+        if self.elapsed_seconds >= self.max_record_seconds:
+            self.on_auto_stop_recording()
+
+    def on_stop_recording(self):
+        self.finish_recording(save=True)
+
+    def on_cancel_recording(self):
+        self.finish_recording(save=False)
+
+    def on_auto_stop_recording(self):
+        self.finish_recording(save=True, auto=True)
+
+    def finish_recording(self, save=True, auto=False):
+        self.elapsed_timer.stop()
+        self.recording_timer_label.setText("")
+        
+        # Clean up recording stream
+        try:
+            if self.record_stream:
+                self.record_stream.stop()
+                self.record_stream.close()
+                self.record_stream = None
+            if hasattr(self, 'auto_stop_timer') and self.auto_stop_timer:
+                self.auto_stop_timer.stop()
+        except Exception as e:
+            print(f"Recording stream close error: {e}")
+            
+        if save:
+            with self._record_lock:
+                if self.recording_data:
+                    recording = np.concatenate(self.recording_data, axis=0)
+                    fname = f"vocal_take_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_omotiv.wav"
+                    vocal_path = os.path.join(self.output_dir, fname)
+                    sf.write(vocal_path, recording, 44100)
+                    self.recorded_vocal = vocal_path
+                    status = f"Take saved as {os.path.basename(vocal_path)}"
+                    if auto:
+                        status += " (auto-stopped at 10:00)"
+                    self.status_label.setText(status)
+                else:
+                    self.status_label.setText("No audio recorded.")
+                    self.recorded_vocal = None
+        else:
+            self.status_label.setText("Recording cancelled.")
+            self.recorded_vocal = None
+            
         self.is_recording = False
-        self.record_btn.setEnabled(True)
         self.update_ui_state()
+        
+        # Restart input monitoring
+        if self.audio_input_device_index is not None:
+            self.input_monitor_timer.start(50)
 
     def on_play_pause_vocal(self):
         if not self.recorded_vocal or not os.path.exists(self.recorded_vocal):
@@ -468,62 +518,100 @@ class RecordingBooth(QDialog):
             self.play_vocal_btn.setText("Play Vocal")
             self.status_label.setText("Vocal paused.")
         else:
-            if self.vocal_player.data is None:
-                self.vocal_player.load(self.recorded_vocal)
+            self.vocal_player.load(self.recorded_vocal)
             self.vocal_player.play()
             self.play_vocal_btn.setText("Pause Vocal")
             self.status_label.setText("Playing vocal take...")
 
     def on_export(self):
-        self.export_group.setVisible(True)
-        mix_selected = self.export_radio_mix.isChecked()
-        vocal_only_selected = self.export_radio_vocal.isChecked()
-        file_path, _ = QFileDialog.getSaveFileName(self, "Export", self.output_dir, "WAV Files (*.wav)")
+        default_fname = f"vocal_mix_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_omotiv.wav"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Vocal Mix", 
+            os.path.join(self.output_dir, default_fname), 
+            "WAV files (*.wav)"
+        )
         if not file_path:
-            self.status_label.setText("Export cancelled.")
-            self.export_group.setVisible(False)
             return
-
+            
         try:
-            if mix_selected and self.input_file and self.recorded_vocal:
-                track, sr_t = sf.read(self.input_file, always_2d=True)
-                vocal, sr_v = sf.read(self.recorded_vocal, always_2d=True)
-                sr = sr_t  # Assumes same samplerate for both
-                min_len = min(len(track), len(vocal))
-                # Apply volume sliders (normalize to 0..1)
-                track_vol = self.track_volume_slider.value() / 100.0
-                vocal_vol = self.vocal_volume_slider.value() / 100.0
-                mix = (track[:min_len] * track_vol) + (vocal[:min_len] * vocal_vol)
-                mix /= max(np.abs(mix).max(), 1e-6)
-                sf.write(file_path, mix, sr)
-                self.status_label.setText(f"Exported mix to {file_path}")
-            elif vocal_only_selected and self.recorded_vocal:
-                vocal, sr = sf.read(self.recorded_vocal, always_2d=True)
-                sf.write(file_path, vocal, sr)
-                self.status_label.setText(f"Exported vocal to {file_path}")
-            else:
-                QMessageBox.warning(self, "Export Error", "No data to export.")
-                self.status_label.setText("Export failed.")
+            track, sr_t = sf.read(self.input_file, always_2d=True)
+            vocal, sr_v = sf.read(self.recorded_vocal, always_2d=True)
+            sr = sr_t
+            
+            # Use trimmed segment for mix
+            start_frame = int(self.trim_start * sr)
+            end_frame = int(self.trim_end * sr) if self.trim_end else len(track)
+            track_trimmed = track[start_frame:end_frame]
+            
+            # Match vocal length to track section
+            vocal_trimmed = vocal[:end_frame-start_frame] if len(vocal) >= (end_frame-start_frame) else np.pad(vocal, ((0, (end_frame-start_frame)-len(vocal)), (0,0)))
+            
+            # Mix with volume controls
+            track_vol = self.track_volume_slider.value() / 100.0
+            vocal_vol = self.vocal_volume_slider.value() / 100.0
+            mix = (track_trimmed * track_vol) + (vocal_trimmed * vocal_vol)
+            
+            # Normalize to prevent clipping
+            max_val = np.abs(mix).max()
+            if max_val > 0.5:
+                mix = mix / max_val * 0.95
+                
+            sf.write(file_path, mix, sr)
+            self.status_label.setText(f"Exported mix to {os.path.basename(file_path)}")
+            
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
             self.status_label.setText("Export failed.")
 
-        self.export_group.setVisible(False)
+    def update_track_info_label(self):
+        """Display read-only track info based on trim settings from main page"""
+        mins = int(self.track_duration_seconds) // 60
+        secs = int(self.track_duration_seconds) % 60
+        
+        # Show the recording section that was set on main page
+        if self.trim_end and self.trim_end < self.track_duration_seconds:
+            section_duration = self.trim_end - self.trim_start
+            section_mins = int(section_duration) // 60
+            section_secs = int(section_duration) % 60
+            info_text = f"Recording section: {self.trim_start:.1f}s to {self.trim_end:.1f}s ({section_mins:02d}:{section_secs:02d})"
+        else:
+            remaining_duration = self.track_duration_seconds - self.trim_start
+            remaining_mins = int(remaining_duration) // 60
+            remaining_secs = int(remaining_duration) % 60
+            info_text = f"Recording section: {self.trim_start:.1f}s to end ({remaining_mins:02d}:{remaining_secs:02d})"
+            
+        info_text += f"\nFull track length: {mins:02d}:{secs:02d}"
+        self.track_info_label.setText(info_text)
 
     def closeEvent(self, event):
-        self.stop_input_stream()
+        """Clean shutdown"""
+        self.input_monitor_timer.stop()
+        self.elapsed_timer.stop()
+        if hasattr(self, 'auto_stop_timer') and self.auto_stop_timer:
+            self.auto_stop_timer.stop()
+            
+        # Stop recording if active
+        if self.record_stream:
+            try:
+                self.record_stream.stop()
+                self.record_stream.close()
+            except Exception:
+                pass
+                
+        self.stop_input_meter_stream()
+        
+        # Stop any playing audio
         if self.track_player.is_playing:
             self.track_player.stop()
         if self.vocal_player.is_playing:
             self.vocal_player.stop()
+            
         event.accept()
 
 if __name__ == '__main__':
-    from PyQt6.QtWidgets import QApplication
-    import sys
     app = QApplication(sys.argv)
     booth = RecordingBooth(
-        input_file="your_track.wav",  # <-- Set to your audio track file
+        input_file="your_track.wav",
         output_dir=os.getcwd()
     )
     booth.show()
